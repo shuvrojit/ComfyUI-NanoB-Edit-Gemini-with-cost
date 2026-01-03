@@ -1,7 +1,7 @@
 [project]
 name = "nanob-edit-gemini"
 description = "This custom node facilitates direct interaction with the Google Gemini API for advanced image editing tasks within ComfyUI with parallel request handling."
-version = "1.0.0"
+version = "1.0.2"
 license = {file = "LICENSE"} 
 # classifiers = [
 #     # For OS-independent nodes (works on all operating systems)
