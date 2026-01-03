@@ -56,6 +56,7 @@ class NanoBEditGemini:
                     "gemini-2.5-flash-image"      # Nano Banana
                 ], {"default": "gemini-3-pro-image-preview"}),
                 "gemini_api_key": ("STRING", {"default": "", "multiline": False}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}), # Added seed control
                 "aspect_ratio": ([
                     "1:1", "16:9", "9:16", "4:3", "3:4", "2:3", "3:2", "5:4", "4:5", "21:9"
                 ], {"default": "1:1"}),
@@ -80,7 +81,7 @@ class NanoBEditGemini:
     CATEGORY = "NanoGemini"
     OUTPUT_NODE = True
 
-    def process(self, prompt, model, gemini_api_key, aspect_ratio="1:1", resolution="1K", num_images=1, safety_filter="block_none", debug_payload=False,
+    def process(self, prompt, model, gemini_api_key, seed, aspect_ratio="1:1", resolution="1K", num_images=1, safety_filter="block_none", debug_payload=False,
                 image1=None, image2=None, image3=None, image4=None, image5=None, image6_14=None):
         
         # Check environment variable if UI field is empty
