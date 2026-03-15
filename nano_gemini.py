@@ -11,6 +11,174 @@ from PIL import Image
 
 # --- Helper Functions ---
 
+MAX_INLINE_REQUEST_BYTES = 20 * 1024 * 1024
+SAFE_INLINE_BUDGET_BYTES = 19 * 1024 * 1024
+
+MODEL_CAPABILITIES = {
+    "gemini-2.5-flash-image": {
+        "supports_512": False,
+        "supports_extended_ratios": False,
+        "supports_google_search": False,
+        "supports_thinking_toggle": False,
+        "max_images": 3,
+    },
+    "gemini-3-pro-image-preview": {
+        "supports_512": False,
+        "supports_extended_ratios": False,
+        "supports_google_search": True,
+        "supports_thinking_toggle": False,
+        "max_images": 14,
+    },
+    "gemini-3.1-flash-image-preview": {
+        "supports_512": True,
+        "supports_extended_ratios": True,
+        "supports_google_search": True,
+        "supports_thinking_toggle": True,
+        "max_images": 14,
+    },
+}
+
+BASE_ASPECT_RATIOS = {"1:1", "16:9", "9:16", "4:3", "3:4", "2:3", "3:2", "5:4", "4:5", "21:9"}
+EXTENDED_31_RATIOS = {"1:4", "4:1", "1:8", "8:1"}
+ALL_ASPECT_RATIOS = sorted(BASE_ASPECT_RATIOS.union(EXTENDED_31_RATIOS))
+OUTPUT_FORMAT_TO_MIME = {
+    "png": "image/png",
+    "jpg": "image/jpeg",
+    "webp": "image/webp",
+}
+
+
+def _validate_model_settings(model, aspect_ratio, resolution, use_google_search, enable_thinking):
+    if model not in MODEL_CAPABILITIES:
+        raise ValueError(f"Unsupported model '{model}'.")
+
+    caps = MODEL_CAPABILITIES[model]
+    valid_aspects = BASE_ASPECT_RATIOS.union(EXTENDED_31_RATIOS if caps["supports_extended_ratios"] else set())
+    if aspect_ratio not in valid_aspects:
+        supported = ", ".join(sorted(valid_aspects))
+        raise ValueError(
+            f"Aspect ratio '{aspect_ratio}' is not supported by model '{model}'. Supported values: {supported}"
+        )
+
+    if resolution == "512" and not caps["supports_512"]:
+        raise ValueError(f"Resolution '512' (0.5K) is only supported by gemini-3.1-flash-image-preview.")
+
+    if model == "gemini-2.5-flash-image" and resolution != "1K":
+        raise ValueError("gemini-2.5-flash-image supports 1K output only in this node.")
+
+    if use_google_search and not caps["supports_google_search"]:
+        raise ValueError(f"Google Search tool is not supported by model '{model}'.")
+
+    if enable_thinking and not caps["supports_thinking_toggle"]:
+        print(f"NanoGemini Info: Thinking toggle is ignored for model '{model}'.")
+
+    return caps
+
+
+def _normalize_seed_for_api(seed):
+    """
+    Gemini expects generationConfig.seed as INT32.
+    Comfy workflows often produce UINT64 seeds, so normalize safely.
+    """
+    if seed is None:
+        return None
+
+    max_i32 = 2147483647
+    min_i32 = -2147483648
+    s = int(seed)
+
+    if min_i32 <= s <= max_i32:
+        return s
+
+    # Keep deterministic behavior while mapping into valid signed INT32 range.
+    normalized = s % (max_i32 + 1)
+    print(
+        f"NanoGemini Warning: Seed {s} is outside INT32 range. "
+        f"Using normalized seed {normalized} for Gemini API."
+    )
+    return normalized
+
+
+def _extract_error_text(response):
+    if response is None:
+        return "No response details available."
+    try:
+        payload = response.json()
+        return json.dumps(payload, indent=2)
+    except Exception:
+        return response.text
+
+
+def _upload_file_via_api(file_bytes, mime_type, display_name, gemini_api_key, timeout=120):
+    start_url = f"https://generativelanguage.googleapis.com/upload/v1beta/files?key={gemini_api_key}"
+    start_headers = {
+        "X-Goog-Upload-Protocol": "resumable",
+        "X-Goog-Upload-Command": "start",
+        "X-Goog-Upload-Header-Content-Length": str(len(file_bytes)),
+        "X-Goog-Upload-Header-Content-Type": mime_type,
+        "Content-Type": "application/json",
+    }
+    start_body = {"file": {"display_name": display_name}}
+
+    start_response = requests.post(start_url, headers=start_headers, json=start_body, timeout=timeout)
+    try:
+        start_response.raise_for_status()
+    except requests.exceptions.HTTPError as e:
+        detail = _extract_error_text(start_response)
+        raise ValueError(f"File API upload start failed (HTTP {start_response.status_code}): {detail}") from e
+
+    upload_url = start_response.headers.get("x-goog-upload-url")
+    if not upload_url:
+        raise ValueError("File API upload failed: missing resumable upload URL in response headers.")
+
+    upload_headers = {
+        "X-Goog-Upload-Offset": "0",
+        "X-Goog-Upload-Command": "upload, finalize",
+        "Content-Length": str(len(file_bytes)),
+    }
+    upload_response = requests.post(upload_url, headers=upload_headers, data=file_bytes, timeout=timeout)
+    try:
+        upload_response.raise_for_status()
+    except requests.exceptions.HTTPError as e:
+        detail = _extract_error_text(upload_response)
+        raise ValueError(f"File API upload finalize failed (HTTP {upload_response.status_code}): {detail}") from e
+
+    try:
+        upload_data = upload_response.json()
+    except Exception as e:
+        raise ValueError("File API upload failed: response was not valid JSON.") from e
+
+    file_uri = ((upload_data.get("file") or {}).get("uri"))
+    if not file_uri:
+        raise ValueError(f"File API upload failed: missing file URI in response: {json.dumps(upload_data, indent=2)}")
+
+    return file_uri
+
+
+def _normalize_output_image(pil_image, output_mime_type):
+    if output_mime_type == "image/png":
+        return pil_image.convert("RGBA" if "A" in pil_image.getbands() else "RGB")
+    if output_mime_type == "image/jpeg":
+        return pil_image.convert("RGB")
+    if output_mime_type == "image/webp":
+        return pil_image.convert("RGBA" if "A" in pil_image.getbands() else "RGB")
+    raise ValueError(f"Unsupported output mime type '{output_mime_type}'.")
+
+
+def _encode_output_preview(pil_image, output_mime_type):
+    fmt_map = {
+        "image/png": "PNG",
+        "image/jpeg": "JPEG",
+        "image/webp": "WEBP",
+    }
+    fmt = fmt_map[output_mime_type]
+    buf = BytesIO()
+    normalized = _normalize_output_image(pil_image, output_mime_type)
+    save_kwargs = {"quality": 95} if fmt in {"JPEG", "WEBP"} else {}
+    normalized.save(buf, format=fmt, **save_kwargs)
+    buf.seek(0)
+    return Image.open(buf).copy()
+
 def tensor2pil(image_tensor):
     """Convert ComfyUI tensor (B=1, H, W, C) to PIL Image (RGB)"""
     if image_tensor is None or image_tensor.shape[0] == 0:
@@ -42,7 +210,7 @@ def pil2tensor(pil_image):
 class NanoBEditGemini:
     """
     ComfyUI Node for Google Gemini Image Editing.
-    Supports Gemini 3 Pro (Nano Banana Pro) and Gemini 2.5 Flash (Nano Banana).
+    Supports Gemini 3 Pro, Gemini 3.1 Flash Image, and Gemini 2.5 Flash Image.
     Directly hits the Google Generative Language API.
     """
     
@@ -53,15 +221,18 @@ class NanoBEditGemini:
                 "prompt": ("STRING", {"default": "Edit the image according to this prompt.", "multiline": True}),
                 "model": ([
                     "gemini-3-pro-image-preview", # Nano Banana Pro
+                    "gemini-3.1-flash-image-preview", # Nano Banana 2
                     "gemini-2.5-flash-image"      # Nano Banana
                 ], {"default": "gemini-3-pro-image-preview"}),
                 "gemini_api_key": ("STRING", {"default": "", "multiline": False}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}), # Added seed control
-                "aspect_ratio": ([
-                    "1:1", "16:9", "9:16", "4:3", "3:4", "2:3", "3:2", "5:4", "4:5", "21:9"
-                ], {"default": "1:1"}),
-                "resolution": (["1K", "2K", "4K"], {"default": "1K"}),
+                "aspect_ratio": (ALL_ASPECT_RATIOS, {"default": "1:1"}),
+                "resolution": (["0.5K", "1K", "2K", "4K"], {"default": "1K"}),
+                "output_format": (["png", "jpg", "webp"], {"default": "png"}),
                 "num_images": ("INT", {"default": 1, "min": 1, "max": 4, "step": 1}),
+                "use_file_api": ("BOOLEAN", {"default": False, "label_on": "Enabled", "label_off": "Disabled"}),
+                "use_google_search": ("BOOLEAN", {"default": False, "label_on": "Enabled", "label_off": "Disabled"}),
+                "enable_thinking": ("BOOLEAN", {"default": False, "label_on": "Enabled", "label_off": "Disabled"}),
                 "safety_filter": (["block_none", "block_few", "block_some", "block_most"], {"default": "block_none"}),
                 "debug_payload": ("BOOLEAN", {"default": False, "label_on": "Enabled", "label_off": "Disabled"}),
             },
@@ -81,15 +252,35 @@ class NanoBEditGemini:
     CATEGORY = "NanoGemini"
     OUTPUT_NODE = True
 
-    def process(self, prompt, model, gemini_api_key, seed, aspect_ratio="1:1", resolution="1K", num_images=1, safety_filter="block_none", debug_payload=False,
+    def process(self, prompt, model, gemini_api_key, seed, aspect_ratio="1:1", resolution="1K", output_format="png",
+                num_images=1, use_file_api=False, use_google_search=False, enable_thinking=False, safety_filter="block_none", debug_payload=False,
                 image1=None, image2=None, image3=None, image4=None, image5=None, image6_14=None):
         
-        # Check environment variable if UI field is empty
-        if not gemini_api_key or gemini_api_key.strip() == "":
-            gemini_api_key = os.environ.get("GEMINI_API_KEY")
+        # Prefer local environment variable by default, fallback to UI value.
+        env_api_key = (os.environ.get("GEMINI_API_KEY") or "").strip()
+        ui_api_key = (gemini_api_key or "").strip()
 
-        if not gemini_api_key or gemini_api_key.strip() == "":
-            raise ValueError("Please provide a valid Google Gemini API Key via the UI or the GEMINI_API_KEY environment variable.")
+        if env_api_key:
+            gemini_api_key = env_api_key
+            if ui_api_key and ui_api_key != env_api_key:
+                print("NanoGemini Info: Using GEMINI_API_KEY from environment (UI key ignored).")
+        elif ui_api_key:
+            gemini_api_key = ui_api_key
+        else:
+            raise ValueError(
+                "Missing API key. Set GEMINI_API_KEY in your environment or provide a key in the node UI."
+            )
+
+        if output_format not in OUTPUT_FORMAT_TO_MIME:
+            raise ValueError(
+                f"Unsupported output format '{output_format}'. Supported values: {', '.join(OUTPUT_FORMAT_TO_MIME.keys())}"
+            )
+        output_mime_type = OUTPUT_FORMAT_TO_MIME[output_format]
+
+        # Keep UI label user-friendly while sending API-compatible value.
+        api_resolution = "512" if resolution == "0.5K" else resolution
+
+        caps = _validate_model_settings(model, aspect_ratio, api_resolution, use_google_search, enable_thinking)
 
         # 1. Prepare Input Images
         input_tensors = []
@@ -116,26 +307,61 @@ class NanoBEditGemini:
             print(f"NanoGemini Warning: {total_inputs} images provided. Truncating to 14 (Gemini 3 Pro limit).")
             input_tensors = input_tensors[:14]
 
+        # Best-effort guidance from current model capabilities
+        if len(input_tensors) > caps["max_images"]:
+            print(
+                f"NanoGemini Warning: {len(input_tensors)} images provided for '{model}'. "
+                f"Recommended max is {caps['max_images']} for best quality."
+            )
+
         input_parts = []
-        
-        # Add the text prompt first
-        input_parts.append({"text": prompt})
 
         # Process input images
+        estimated_payload_bytes = len(prompt.encode("utf-8"))
         for i, img_tensor in enumerate(input_tensors):
             pil_img = tensor2pil(img_tensor)
             if pil_img:
                 buffer = BytesIO()
                 pil_img.save(buffer, format="PNG") # PNG is robust
-                b64_data = base64.b64encode(buffer.getvalue()).decode("utf-8")
-                
-                # FIX: Use camelCase keys for REST API (inlineData, mimeType)
-                input_parts.append({
-                    "inlineData": {
-                        "mimeType": "image/png",
-                        "data": b64_data
-                    }
-                })
+                raw_bytes = buffer.getvalue()
+                if use_file_api:
+                    try:
+                        file_uri = _upload_file_via_api(
+                            raw_bytes,
+                            "image/png",
+                            f"nanogemini_input_{i+1}.png",
+                            gemini_api_key,
+                        )
+                    except Exception as e:
+                        raise ValueError(f"Failed to upload input image {i+1} via File API: {e}") from e
+
+                    input_parts.append({
+                        "fileData": {
+                            "mimeType": "image/png",
+                            "fileUri": file_uri
+                        }
+                    })
+                else:
+                    b64_data = base64.b64encode(raw_bytes).decode("utf-8")
+                    estimated_payload_bytes += len(b64_data)
+                    
+                    # FIX: Use camelCase keys for REST API (inlineData, mimeType)
+                    input_parts.append({
+                        "inlineData": {
+                            "mimeType": "image/png",
+                            "data": b64_data
+                        }
+                    })
+
+        # For multimodal understanding quality, keep text instruction after image parts.
+        input_parts.append({"text": prompt})
+
+        if not use_file_api and estimated_payload_bytes > SAFE_INLINE_BUDGET_BYTES:
+            raise ValueError(
+                f"Estimated inline payload is too large ({estimated_payload_bytes / (1024*1024):.2f} MB). "
+                f"Reduce image count/resolution to stay under ~{MAX_INLINE_REQUEST_BYTES / (1024*1024):.0f} MB request limits, "
+                f"or enable the File API toggle."
+            )
 
         # 2. Configure API Payload
         safety_map = {
@@ -155,22 +381,38 @@ class NanoBEditGemini:
             {"category": cat, "threshold": safety_map[safety_filter]} for cat in safety_categories
         ]
 
+        image_config = {"aspectRatio": aspect_ratio}
+        # 2.5 works best with ratio-only config; 3.x supports imageSize control.
+        if model != "gemini-2.5-flash-image":
+            image_config["imageSize"] = api_resolution
+
+        normalized_seed = _normalize_seed_for_api(seed)
+
+        generation_config = {
+            "responseModalities": ["IMAGE", "TEXT"],
+            "candidateCount": 1,
+            "imageConfig": image_config,
+            "seed": normalized_seed,
+        }
+
+        # For 3.1 Flash Image, map toggle to thinking level.
+        if model == "gemini-3.1-flash-image-preview":
+            generation_config["thinkingConfig"] = {
+                "thinkingLevel": "HIGH" if enable_thinking else "MINIMAL",
+                "includeThoughts": False,
+            }
+
         payload = {
             # Explicitly wrapping in role="user" is safer for newer Pro models
             "contents": [{
                 "role": "user",
                 "parts": input_parts
             }],
-            "generationConfig": {
-                "responseModalities": ["IMAGE", "TEXT"], 
-                "candidateCount": 1, 
-                "imageConfig": {
-                    "aspectRatio": aspect_ratio,
-                    "imageSize": resolution
-                }
-            },
+            "generationConfig": generation_config,
             "safetySettings": safety_settings
         }
+        if use_google_search:
+            payload["tools"] = [{"google_search": {}}]
 
         # --- DEBUG OUTPUT ---
         if debug_payload:
@@ -184,12 +426,14 @@ class NanoBEditGemini:
                     data_len = len(part["inlineData"]["data"])
                     total_size_estimate += data_len
                     part["inlineData"]["data"] = f"<Base64 Image Data: {data_len} chars>"
+                elif "fileData" in part:
+                    part["fileData"]["fileUri"] = "<Uploaded File URI>"
             
             print("--- NANO GEMINI DEBUG PAYLOAD START ---")
             print(json.dumps(debug_print, indent=2))
             print(f"Approximate Payload Size (Images Only): {total_size_estimate / (1024*1024):.2f} MB")
-            if total_size_estimate > 20 * 1024 * 1024:
-                print("WARNING: Payload exceeds 20MB limit! API will likely fail.")
+            if not use_file_api and estimated_payload_bytes > SAFE_INLINE_BUDGET_BYTES:
+                print("WARNING: Payload exceeds safe inline budget and may fail near 20MB request limits.")
             print("--- NANO GEMINI DEBUG PAYLOAD END ---")
 
         # 3. Define the Request Function
@@ -201,10 +445,16 @@ class NanoBEditGemini:
                 response = requests.post(url, headers=headers, json=payload, timeout=120)
                 response.raise_for_status()
                 return response.json()
+            except requests.exceptions.HTTPError as e:
+                status = e.response.status_code if e.response is not None else "unknown"
+                detail = e.response.text if e.response is not None else str(e)
+                print(f"Gemini API Request {idx+1} Failed (HTTP {status}): {detail}")
+                return {"_error": f"HTTP {status}: {detail}"}
+            except requests.exceptions.RequestException as e:
+                print(f"Gemini API Request {idx+1} Failed (Network): {e}")
+                return {"_error": f"Network error: {e}"}
             except Exception as e:
                 print(f"Gemini API Request {idx+1} Failed: {e}")
-                if hasattr(e, 'response') and e.response is not None:
-                     print(f"Error details: {e.response.text}")
                 return None
 
         # 4. Execute Parallel Requests (if num_images > 1)
@@ -226,6 +476,10 @@ class NanoBEditGemini:
 
         for i, res in enumerate(results):
             try:
+                if "_error" in res:
+                    collected_errors.append(f"Req {i+1}: {res['_error'][:300]}")
+                    continue
+
                 candidates = res.get("candidates", [])
                 
                 if "promptFeedback" in res:
@@ -257,7 +511,9 @@ class NanoBEditGemini:
                                 try:
                                     img_data = base64.b64decode(b64_img)
                                     pil_out = Image.open(BytesIO(img_data))
-                                    tensor_out = pil2tensor(pil_out)
+                                    # Normalize output format so downstream receives deterministic encoding behavior.
+                                    normalized = _encode_output_preview(pil_out, output_mime_type)
+                                    tensor_out = pil2tensor(normalized)
                                     output_tensors.append(tensor_out)
                                     image_found_in_candidate = True
                                 except Exception as e:
