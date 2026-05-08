@@ -1,5 +1,6 @@
 import os
 import requests
+import torch
 import base64
 import numpy as np
 import json
@@ -9,10 +10,6 @@ import time
 from io import BytesIO
 from PIL import Image
 
-try:
-    import torch
-except ImportError:
-    torch = None
 
 # --- Helper Functions ---
 
