@@ -1,5 +1,4 @@
 import os
-import torch
 import requests
 import base64
 import numpy as np
@@ -9,6 +8,11 @@ import concurrent.futures
 import time
 from io import BytesIO
 from PIL import Image
+
+try:
+    import torch
+except ImportError:
+    torch = None
 
 # --- Helper Functions ---
 
@@ -46,6 +50,13 @@ OUTPUT_FORMAT_TO_MIME = {
     "png": "image/png",
     "jpg": "image/jpeg",
     "webp": "image/webp",
+}
+
+# USD per 1M tokens. The node uses standard Gemini Developer API pricing.
+PRICING_USD_PER_1M = {
+    "gemini-2.5-flash-image": {"input": 0.30, "output_text": 2.50, "output_image": 30.00},
+    "gemini-3.1-flash-image-preview": {"input": 0.50, "output_text": 3.00, "output_image": 60.00},
+    "gemini-3-pro-image-preview": {"input": 2.00, "output_text": 12.00, "output_image": 120.00},
 }
 
 
@@ -181,6 +192,70 @@ def _encode_output_preview(pil_image, output_mime_type):
     return Image.open(buf).copy()
 
 
+def _tokens_by_modality(details):
+    counts = {}
+    if not isinstance(details, list):
+        return counts
+
+    for item in details:
+        if not isinstance(item, dict):
+            continue
+
+        modality = str(item.get("modality", "UNSPECIFIED")).upper()
+        token_count = item.get("tokenCount", 0) or 0
+
+        try:
+            token_count = int(token_count)
+        except (TypeError, ValueError):
+            token_count = 0
+
+        counts[modality] = counts.get(modality, 0) + token_count
+
+    return counts
+
+
+def _estimate_gemini_cost(usage, model):
+    rates = PRICING_USD_PER_1M.get(model)
+    if not rates:
+        return None
+
+    prompt_tokens = int(usage.get("promptTokenCount") or 0)
+    candidate_tokens = int(usage.get("candidatesTokenCount") or 0)
+
+    prompt_by_modality = _tokens_by_modality(usage.get("promptTokensDetails"))
+    candidate_by_modality = _tokens_by_modality(usage.get("candidatesTokensDetails"))
+
+    input_tokens = sum(prompt_by_modality.values()) if prompt_by_modality else prompt_tokens
+    image_output_tokens = candidate_by_modality.get("IMAGE", 0)
+    known_candidate_tokens = sum(candidate_by_modality.values())
+    output_text_tokens = sum(
+        count
+        for modality, count in candidate_by_modality.items()
+        if modality != "IMAGE"
+    )
+
+    if candidate_by_modality:
+        unclassified_output_tokens = max(candidate_tokens - known_candidate_tokens, 0)
+    else:
+        unclassified_output_tokens = candidate_tokens
+
+    return (
+        input_tokens * rates["input"] / 1_000_000
+        + (output_text_tokens + unclassified_output_tokens) * rates["output_text"] / 1_000_000
+        + image_output_tokens * rates["output_image"] / 1_000_000
+    )
+
+
+def _print_gemini_usage_summary(model, usage):
+    estimated_cost = _estimate_gemini_cost(usage, model)
+    total_cost = "unavailable" if estimated_cost is None else f"${estimated_cost:.8f}"
+
+    print(f"input token: {usage.get('promptTokenCount')}", flush=True)
+    print(f"output token: {usage.get('candidatesTokenCount')}", flush=True)
+    print(f"total token: {usage.get('totalTokenCount')}", flush=True)
+    print(f"total cost: {total_cost}", flush=True)
+
+
 def _log_gemini_usage(model, request_idx, usage, input_image_count):
     """
     Logs Gemini REST usageMetadata per generateContent call.
@@ -209,8 +284,12 @@ def _log_gemini_usage(model, request_idx, usage, input_image_count):
         "toolUsePromptTokensDetails": usage.get("toolUsePromptTokensDetails"),
     }
 
+    cost = _estimate_gemini_cost(usage, model)
+    if cost is not None:
+        row["estimatedCostUsd"] = cost
+
     line = json.dumps(row, ensure_ascii=False)
-    print("[NanoGemini usage] " + line, flush=True)
+    _print_gemini_usage_summary(model, usage)
 
     try:
         out_dir = os.path.join(os.getcwd(), "output")
@@ -245,6 +324,8 @@ def tensor2pil(image_tensor):
 
 def pil2tensor(pil_image):
     """Convert PIL Image (RGB) back to ComfyUI tensor (B=1, H, W, C)"""
+    if torch is None:
+        raise RuntimeError("Torch is required to convert PIL images to ComfyUI tensors.")
     if pil_image is None:
         return None
     arr = np.array(pil_image).astype(np.float32) / 255.0

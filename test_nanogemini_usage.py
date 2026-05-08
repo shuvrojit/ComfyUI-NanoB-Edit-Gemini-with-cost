@@ -12,6 +12,8 @@ from pathlib import Path
 import requests
 from PIL import Image
 
+from nano_gemini import _print_gemini_usage_summary
+
 
 SAFETY_MAP = {
     "block_none": "BLOCK_NONE",
@@ -201,20 +203,6 @@ def estimate_costs_by_tier(usage, model, pricing_tiers):
     }
 
 
-def print_cost_line(call_index, tier, cost):
-    if cost and cost.get("pricingAvailable"):
-        print(
-            f"[call {call_index}] estimated {tier} cost: "
-            f"${cost['estimatedCostUsd']:.8f} "
-            f"(input=${cost['inputCostUsd']:.8f}, "
-            f"text_out=${cost['outputTextCostUsd']:.8f}, "
-            f"image_out=${cost['outputImageCostUsd']:.8f})",
-            flush=True,
-        )
-    elif cost:
-        print(f"[call {call_index}] {tier} cost unavailable: {cost['pricingNote']}", flush=True)
-
-
 def log_usage(data, model, call_index, log_path, pricing_tiers):
     usage = data.get("usageMetadata")
 
@@ -242,15 +230,11 @@ def log_usage(data, model, call_index, log_path, pricing_tiers):
         "costs": costs_by_tier,
     }
 
-    print(f"\n[call {call_index}] Gemini usage:")
-    print(json.dumps(row, indent=2, ensure_ascii=False), flush=True)
-
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
-    for tier, cost in costs_by_tier.items():
-        print_cost_line(call_index, tier, cost)
+    _print_gemini_usage_summary(model, usage)
 
     return costs_by_tier
 
@@ -454,31 +438,8 @@ def main():
     if args.num_calls < 1:
         raise ValueError("--num-calls must be >= 1")
 
-    total_costs = {tier: 0.0 for tier in args.cost_tiers}
-    priced_calls = {tier: 0 for tier in args.cost_tiers}
-
     for call_index in range(1, args.num_calls + 1):
-        costs_by_tier = call_gemini(args, call_index)
-        if not costs_by_tier:
-            continue
-
-        for tier, cost in costs_by_tier.items():
-            if cost and cost.get("pricingAvailable"):
-                total_costs[tier] += cost["estimatedCostUsd"]
-                priced_calls[tier] += 1
-
-    if any(priced_calls.values()):
-        print("\n[total] estimated costs:")
-        for tier in args.cost_tiers:
-            if priced_calls[tier]:
-                print(
-                    f"[total] {tier}: ${total_costs[tier]:.8f} "
-                    f"for {priced_calls[tier]} priced call(s)"
-                )
-        print("[total] pricing sources:")
-        for tier in args.cost_tiers:
-            source = PRICING_SOURCE_URLS.get(tier, "https://ai.google.dev/gemini-api/docs/pricing")
-            print(f"[total] {tier}: {source}")
+        call_gemini(args, call_index)
 
 
 if __name__ == "__main__":
