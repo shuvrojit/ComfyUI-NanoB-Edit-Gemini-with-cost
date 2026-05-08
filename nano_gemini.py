@@ -6,6 +6,7 @@ import numpy as np
 import json
 import copy
 import concurrent.futures
+import time
 from io import BytesIO
 from PIL import Image
 
@@ -178,6 +179,49 @@ def _encode_output_preview(pil_image, output_mime_type):
     normalized.save(buf, format=fmt, **save_kwargs)
     buf.seek(0)
     return Image.open(buf).copy()
+
+
+def _log_gemini_usage(model, request_idx, usage, input_image_count):
+    """
+    Logs Gemini REST usageMetadata per generateContent call.
+    Writes to output/gemini_usage.jsonl and prints to the ComfyUI terminal.
+    """
+    if not isinstance(usage, dict):
+        print(
+            f"[NanoGemini usage] req={request_idx} model={model} usageMetadata missing",
+            flush=True,
+        )
+        return
+
+    row = {
+        "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "request": request_idx,
+        "model": model,
+        "input_image_count": input_image_count,
+        "promptTokenCount": usage.get("promptTokenCount"),
+        "candidatesTokenCount": usage.get("candidatesTokenCount"),
+        "totalTokenCount": usage.get("totalTokenCount"),
+        "thoughtsTokenCount": usage.get("thoughtsTokenCount"),
+        "toolUsePromptTokenCount": usage.get("toolUsePromptTokenCount"),
+        "cachedContentTokenCount": usage.get("cachedContentTokenCount"),
+        "promptTokensDetails": usage.get("promptTokensDetails"),
+        "candidatesTokensDetails": usage.get("candidatesTokensDetails"),
+        "toolUsePromptTokensDetails": usage.get("toolUsePromptTokensDetails"),
+    }
+
+    line = json.dumps(row, ensure_ascii=False)
+    print("[NanoGemini usage] " + line, flush=True)
+
+    try:
+        out_dir = os.path.join(os.getcwd(), "output")
+        os.makedirs(out_dir, exist_ok=True)
+
+        log_path = os.path.join(out_dir, "gemini_usage.jsonl")
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception as e:
+        print(f"[NanoGemini usage] failed to write usage log: {e}", flush=True)
+
 
 def tensor2pil(image_tensor):
     """Convert ComfyUI tensor (B=1, H, W, C) to PIL Image (RGB)"""
@@ -444,7 +488,19 @@ class NanoBEditGemini:
             try:
                 response = requests.post(url, headers=headers, json=payload, timeout=120)
                 response.raise_for_status()
-                return response.json()
+                data = response.json()
+
+                # Keep the original request number because num_images uses parallel requests.
+                data["_request_index"] = idx + 1
+
+                _log_gemini_usage(
+                    model=model,
+                    request_idx=idx + 1,
+                    usage=data.get("usageMetadata"),
+                    input_image_count=len(input_tensors),
+                )
+
+                return data
             except requests.exceptions.HTTPError as e:
                 status = e.response.status_code if e.response is not None else "unknown"
                 detail = e.response.text if e.response is not None else str(e)
