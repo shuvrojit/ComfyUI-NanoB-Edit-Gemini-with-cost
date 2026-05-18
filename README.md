@@ -102,6 +102,7 @@ To improve quality and instruction following:
 - HTTP/network errors include per-request diagnostics.
 - Candidate parsing failures include finish reason + snippet of text response when no image is returned.
 - Safety blocks from `promptFeedback` are surfaced in logs.
+- Gemini usage logs are written to `output/gemini_usage.jsonl` with token counts, estimated cost, `user_id`, and `username` when ComfyUI-Sentinel is installed and has an active user.
 
 ## Output Format Support
 

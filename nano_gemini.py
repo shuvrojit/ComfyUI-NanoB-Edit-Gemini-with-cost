@@ -7,6 +7,7 @@ import json
 import copy
 import concurrent.futures
 import time
+import sys
 from io import BytesIO
 from PIL import Image
 
@@ -243,10 +244,73 @@ def _estimate_gemini_cost(usage, model):
     )
 
 
-def _print_gemini_usage_summary(model, usage):
+def _get_username_from_sentinel_users_db(users_db, user_id):
+    if users_db is None or not user_id:
+        return None
+
+    try:
+        if hasattr(users_db, "load_users"):
+            users_db.load_users()
+    except Exception:
+        pass
+
+    try:
+        users = getattr(users_db, "users", None)
+        user_data = users.get(user_id) if isinstance(users, dict) else None
+        if isinstance(user_data, dict) and user_data.get("username"):
+            return user_data.get("username")
+    except Exception:
+        pass
+
+    if hasattr(users_db, "get_user"):
+        try:
+            result = users_db.get_user(user_id=user_id)
+            if isinstance(result, tuple):
+                for item in result:
+                    if isinstance(item, dict) and item.get("username"):
+                        return item.get("username")
+        except Exception:
+            pass
+
+    return None
+
+
+def _get_sentinel_user():
+    """
+    Return the current ComfyUI-Sentinel user when Sentinel is installed.
+
+    Sentinel stores the active user in its access_control object while handling
+    /api/prompt. This lookup is intentionally optional so the node still works
+    normally without ComfyUI-Sentinel.
+    """
+    for module in list(sys.modules.values()):
+        access_control = getattr(module, "access_control", None)
+        if access_control is None or not hasattr(access_control, "get_current_user_id"):
+            continue
+
+        try:
+            user_id = access_control.get_current_user_id()
+        except Exception:
+            continue
+
+        if user_id:
+            user_id = str(user_id)
+            users_db = getattr(module, "users_db", None) or getattr(access_control, "users_db", None)
+            username = _get_username_from_sentinel_users_db(users_db, user_id)
+
+            return user_id, username
+
+    return None, None
+
+
+def _print_gemini_usage_summary(model, usage, user_id=None, username=None):
     estimated_cost = _estimate_gemini_cost(usage, model)
     total_cost = "unavailable" if estimated_cost is None else f"${estimated_cost:.8f}"
 
+    if user_id:
+        print(f"user id: {user_id}", flush=True)
+    if username:
+        print(f"username: {username}", flush=True)
     print(f"input token: {usage.get('promptTokenCount')}", flush=True)
     print(f"output token: {usage.get('candidatesTokenCount')}", flush=True)
     print(f"total token: {usage.get('totalTokenCount')}", flush=True)
@@ -265,9 +329,13 @@ def _log_gemini_usage(model, request_idx, usage, input_image_count):
         )
         return
 
+    user_id, username = _get_sentinel_user()
+
     row = {
         "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
         "request": request_idx,
+        "user_id": user_id,
+        "username": username,
         "model": model,
         "input_image_count": input_image_count,
         "promptTokenCount": usage.get("promptTokenCount"),
@@ -286,7 +354,7 @@ def _log_gemini_usage(model, request_idx, usage, input_image_count):
         row["estimatedCostUsd"] = cost
 
     line = json.dumps(row, ensure_ascii=False)
-    _print_gemini_usage_summary(model, usage)
+    _print_gemini_usage_summary(model, usage, user_id=user_id, username=username)
 
     try:
         out_dir = os.path.join(os.getcwd(), "output")
