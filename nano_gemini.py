@@ -283,19 +283,31 @@ def _get_sentinel_user():
     /api/prompt. This lookup is intentionally optional so the node still works
     normally without ComfyUI-Sentinel.
     """
-    for module in list(sys.modules.values()):
-        access_control = getattr(module, "access_control", None)
-        if access_control is None or not hasattr(access_control, "get_current_user_id"):
+    for module_name, module in list(sys.modules.items()):
+        normalized_name = str(module_name).lower()
+        if "sentinel" not in normalized_name or normalized_name.startswith("torch"):
             continue
 
         try:
-            user_id = access_control.get_current_user_id()
+            access_control = getattr(module, "access_control", None)
+            get_current_user_id = getattr(access_control, "get_current_user_id", None)
+        except Exception:
+            continue
+
+        if access_control is None or not callable(get_current_user_id):
+            continue
+
+        try:
+            user_id = get_current_user_id()
         except Exception:
             continue
 
         if user_id:
             user_id = str(user_id)
-            users_db = getattr(module, "users_db", None) or getattr(access_control, "users_db", None)
+            try:
+                users_db = getattr(module, "users_db", None) or getattr(access_control, "users_db", None)
+            except Exception:
+                users_db = None
             username = _get_username_from_sentinel_users_db(users_db, user_id)
 
             return user_id, username
@@ -329,7 +341,11 @@ def _log_gemini_usage(model, request_idx, usage, input_image_count):
         )
         return
 
-    user_id, username = _get_sentinel_user()
+    try:
+        user_id, username = _get_sentinel_user()
+    except Exception as e:
+        print(f"[NanoGemini usage] Sentinel user lookup failed: {e}", flush=True)
+        user_id, username = None, None
 
     row = {
         "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -639,12 +655,15 @@ class NanoBEditGemini:
                 # Keep the original request number because num_images uses parallel requests.
                 data["_request_index"] = idx + 1
 
-                _log_gemini_usage(
-                    model=model,
-                    request_idx=idx + 1,
-                    usage=data.get("usageMetadata"),
-                    input_image_count=len(input_tensors),
-                )
+                try:
+                    _log_gemini_usage(
+                        model=model,
+                        request_idx=idx + 1,
+                        usage=data.get("usageMetadata"),
+                        input_image_count=len(input_tensors),
+                    )
+                except Exception as e:
+                    print(f"[NanoGemini usage] failed to log usage for req={idx+1}: {e}", flush=True)
 
                 return data
             except requests.exceptions.HTTPError as e:
